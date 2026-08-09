@@ -15,8 +15,10 @@
   const FLAG_REPEAT = 3;
   // 旗子横向偏移：占旗子宽度的比例，用于把侧边细节显示到球心（正 = 向右偏移采样）
   const FLAG_X_OFFSET = -0.2;
-  // 默认旗子（线上图片，需支持 CORS；可用 ?flag=<url> 覆盖，支持 png/svg/jpg 等）
-  const DEFAULT_FLAG = 'https://flagpedia.net/data/flags/w580/by.webp';
+  // 本地默认旗子：使用相对 base 路径，兼容 GitHub Pages 子路径部署（如 /CBPoC/）。
+  // 用本地资源避免线上图缺 CORS 导致画布被污染/加载失败；?flag=<url> 仍可覆盖（png/svg/jpg 及线上链接）。
+  const FLAG_PATH = import.meta.env.BASE_URL + 'flag-usa.svg';
+  const DEFAULT_FLAG = FLAG_PATH;
   // 球轮廓描边粗细，占球半径的比例（0 = 不描边）
   const BALL_STROKE = 0.08;
 
@@ -46,6 +48,7 @@
   const BALL_DECEL = 20; // 松手减速度（球半径/秒²）
   const GRAVITY = 26; // 重力加速度（球半径/秒²）
   const JUMP_VEL = 9; // 起跳初速度（球半径/秒，向上）
+  const SCALE_SPEED = 0.5; // 缩放速率（每秒相对增长率；w/s 按住时指数增长/缩小）
 
   // 阴影参数（长度以球半径为单位）
   const BALL_SHADOW_STRENGTH = 0.3; // 球底部阴影强度（0-1；0 = 关闭）
@@ -62,6 +65,9 @@
   const SQUASH_HORIZ_LAMBDA = 3; // 走路正弦波长 lambda（每移动 1 球半径对应的弧度）
   const SQUASH_VERT_EPS = 0.001; // 竖直加速度调节系数 epsilon
   const SQUASH_ACCEL_WINDOW = 6; // 竖直加速度滑动窗口帧数
+  // 原地成长/缩小时的呼吸/走路正弦：振幅与角速度都更大，让缩放过程呈现明显的正弦动画
+  const GROW_BOUNCE_AMP = 0.1; // 成长/缩小正弦振幅
+  const GROW_BOUNCE_LAMBDA = 16; // 成长/缩小正弦角速度（弧度/秒）
 
   // 球的形状：用户 Inkscape 画的半边轮廓 SVG path，左右镜像后得到完整球轮廓。
   const BALL_PATH =
@@ -343,10 +349,10 @@
         };
       } catch {
         // 跨域图片导致画布被污染，无法读取像素：回退本地 SVG
-        if (flag.src !== '/flag-usa.svg') {
+        if (flag.src !== FLAG_PATH) {
           flag = null;
           const fb = new Image();
-          fb.src = '/flag-usa.svg';
+          fb.src = FLAG_PATH;
           fb.onload = () => {
             flag = fb;
             buildSrc();
@@ -574,9 +580,11 @@
     const update = (dt: number) => {
       const { W, H, r } = view;
       if (r === 0) return;
-      // 缩放：w 变大、s 变小（模拟靠近/远离）；协变到半径
-      const SCALE_SPEED = 1.5; // 缩放速度（倍率/秒）
-      ballScale = Math.max(0.3, Math.min(3, ballScale + ((keys.grow ? 1 : 0) - (keys.shrink ? 1 : 0)) * SCALE_SPEED * dt));
+      // 缩放：w 变大、s 变小（模拟靠近/远离）；协变到半径。
+      // 乘除/指数式缩放：速度正比于当前 scale，w/s 按住时按比例连续增长/衰减。
+      const growDir = (keys.grow ? 1 : 0) - (keys.shrink ? 1 : 0);
+      if (growDir !== 0) ballScale *= Math.exp(growDir * SCALE_SPEED * dt);
+      ballScale = Math.max(0.3, Math.min(3, ballScale));
       const re = r * ballScale; // 有效半径
       // 水平速度：目标速度由按键决定；落地才减速（空气中保持水平速度，不至于垂直下落）
       const maxV = BALL_SPEED * re;
@@ -603,10 +611,16 @@
       if (ballX > W - re) ballX = W - re;
 
       // ---- 压扁拉伸（面积不变） ----
-      // 横向：走路正弦，h = 1 - A·sin(lambda·vx·t)，相位随移动距离累积
-      if (Math.abs(ballVx) > re * 0.01) walkPhase += SQUASH_HORIZ_LAMBDA * (ballVx / re) * dt;
-      else walkPhase = 0;
-      const hHoriz = 1 - SQUASH_HORIZ_AMP * Math.sin(walkPhase);
+      // 横向：走路正弦，h = 1 - A·sin(lambda·vx·t)，相位随移动距离累积。
+      // 水平移动时按速度推进；原地成长/缩小时也以固定速率推进，从而产生明显的正弦弹跳。
+      const moving = Math.abs(ballVx) > re * 0.01;
+      if (moving || keys.grow || keys.shrink) {
+        const speed = moving ? ballVx / re : keys.grow ? 1 : -1;
+        walkPhase += (moving ? SQUASH_HORIZ_LAMBDA : GROW_BOUNCE_LAMBDA) * speed * dt;
+      } else {
+        walkPhase = 0;
+      }
+      const hHoriz = 1 - (moving ? SQUASH_HORIZ_AMP : GROW_BOUNCE_AMP) * Math.sin(walkPhase);
       // 竖直：加速度（速度变化率滑动窗口均值）。向上加速压扁、向下加速拉长。
       const instAy = dt > 0 ? (ballVy - prevVy) / dt / re : 0; // 有效半径/秒²，向上为负
       prevVy = ballVy;
@@ -643,7 +657,7 @@
         buildSrc();
       };
       im.onerror = () => {
-        if (src !== '/flag-usa.svg') loadFlag('/flag-usa.svg');
+        if (src !== FLAG_PATH) loadFlag(FLAG_PATH);
       };
       im.src = src;
     };
